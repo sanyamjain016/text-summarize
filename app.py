@@ -1,100 +1,145 @@
 from flask import Flask, render_template, request
-import heapq
 import re
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import nltk
-from string import punctuation
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize, word_tokenize
 
-# ensure nltk data
-for res, path in [("punkt","tokenizers/punkt"),("punkt_tab","tokenizers/punkt_tab"),("stopwords","corpora/stopwords")]:
+# --- NLTK Setup ---
+# We check for resources to avoid constant downloading
+required_nltk = [
+    ("punkt", "tokenizers/punkt"),
+    ("punkt_tab", "tokenizers/punkt_tab"),
+    ("stopwords", "corpora/stopwords")
+]
+for res, path in required_nltk:
     try:
         nltk.data.find(path)
     except LookupError:
+        print(f"Downloading {res}...")
         nltk.download(res, quiet=True)
 
 app = Flask(__name__)
 
+# --- Configuration ---
+# Adjusted presets for better reading flow
 LENGTH_PRESETS = {
-    "short":  {"target_words": 120, "max_sentences": 3},
-    "medium": {"target_words": 220, "max_sentences": 5},
-    "long":   {"target_words": 350, "max_sentences": 8},
+    "short":  {"target_words": 100, "min_sentences": 2, "max_sentences": 3},
+    "medium": {"target_words": 200, "min_sentences": 4, "max_sentences": 6},
+    "long":   {"target_words": 350, "min_sentences": 7, "max_sentences": 12},
 }
 
-def summarize_text(text: str, target_words: int = 120, max_sentences: int = 3) -> str:
+def clean_text(text):
+    """Basic cleanup of raw text."""
+    # Remove citation brackets like [1], [12]
+    text = re.sub(r'\[\d+\]', '', text)
+    # Collapse multiple spaces/newlines
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def summarize_text(text: str, preset_name: str = "short") -> str:
+    """
+    Extractive summarization using weighted frequency.
+    Improves upon the original by preventing mid-sentence cut-offs
+    and normalizing scores to avoid bias toward long sentences.
+    """
     if not text:
         return ""
-    text = re.sub(r"\[[0-9]*\]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\n+", " ", text)
-    sentences = sent_tokenize(text)
-    if not sentences:
-        return ""
-    if len(sentences) <= max_sentences:
-        return " ".join(sentences)
 
+    text = clean_text(text)
+    sentences = sent_tokenize(text)
+    
+    # If text is very short, just return it
+    if len(sentences) <= LENGTH_PRESETS["short"]["max_sentences"]:
+        return text
+
+    # Get constraints based on preset
+    settings = LENGTH_PRESETS.get(preset_name, LENGTH_PRESETS["short"])
+    max_sents = settings["max_sentences"]
+    
+    # 1. Frequency Analysis
     try:
         stop_words = set(stopwords.words("english"))
-    except Exception:
+    except:
         stop_words = set()
 
     words = word_tokenize(text.lower())
-    freq = {}
-    for w in words:
-        if w.isalpha() and w not in stop_words and w not in punctuation:
-            freq[w] = freq.get(w, 0) + 1
-    if not freq:
-        return " ".join(sentences[:max_sentences])
+    freq_table = {}
+    for word in words:
+        if word.isalnum() and word not in stop_words:
+            freq_table[word] = freq_table.get(word, 0) + 1
 
-    scored = []
-    for idx, s in enumerate(sentences):
-        s_words = word_tokenize(s.lower())
-        score = sum(freq.get(w, 0) for w in s_words if w.isalpha())
-        wcount = sum(1 for w in s_words if w.isalpha())
-        if wcount > 0:
-            scored.append((score, idx, s, wcount))
-    if not scored:
-        return " ".join(sentences[:max_sentences])
+    # Normalize frequencies (divide by max frequency)
+    if freq_table:
+        max_freq = max(freq_table.values())
+        for word in freq_table:
+            freq_table[word] = freq_table[word] / max_freq
+    else:
+        # Fallback if no valid words found
+        return " ".join(sentences[:max_sents])
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    chosen = []
-    acc_words = 0
-    for score, idx, s, wcount in scored:
-        if len(chosen) >= max_sentences:
-            break
-        if acc_words >= target_words and chosen:
-            break
-        chosen.append((idx, s, wcount))
-        acc_words += wcount
-    chosen.sort(key=lambda x: x[0])
-    result = " ".join(s for _, s, _ in chosen)
-    result_words = result.split()
-    if len(result_words) > target_words * 1.25:
-        result = " ".join(result_words[: int(target_words * 1.25)]) + "…"
-    return result
+    # 2. Score Sentences
+    sentence_scores = {}
+    for i, sentence in enumerate(sentences):
+        sentence_word_count = 0
+        score = 0
+        for word in word_tokenize(sentence.lower()):
+            if word in freq_table:
+                score += freq_table[word]
+                sentence_word_count += 1
+        
+        # KEY IMPROVEMENT: Normalization
+        # We divide score by word count so very long sentences don't unfairly win.
+        # We also ignore very short sentences (under 4 words) as they are usually noise.
+        if sentence_word_count > 4:
+            sentence_scores[i] = score / sentence_word_count 
 
-def _looks_like_url(value: str) -> bool:
-    try:
-        u = urlparse(value)
-        return u.scheme in ("http", "https") and bool(u.netloc)
-    except Exception:
-        return False
+    # 3. Select Top Sentences
+    # Sort by score descending
+    sorted_indices = sorted(sentence_scores, key=sentence_scores.get, reverse=True)
+    
+    # Take top N sentences based on preset
+    selected_indices = sorted_indices[:max_sents]
+    
+    # 4. Reorder by appearance in original text to maintain flow
+    selected_indices.sort()
+    
+    final_summary = " ".join([sentences[i] for i in selected_indices])
+    return final_summary
 
 def extract_text_from_html(html: str) -> str:
+    """
+    Improved extraction: Prioritizes paragraph tags to avoid 
+    grabbing navigation menus and footers.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript"]):
-        tag.extract()
-    text = soup.get_text(separator=" ")
-    return " ".join(text.split())
+    
+    # Kill all script and style elements
+    for script in soup(["script", "style", "noscript", "nav", "footer", "header"]):
+        script.extract()    
 
-def fetch_text_from_url(url: str, timeout: int = 15) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return extract_text_from_html(resp.text)
+    # Strategy: Try to get text from <p> tags first as they contain the meat of articles
+    paragraphs = soup.find_all('p')
+    if len(paragraphs) > 5:
+        text = ' '.join([p.get_text() for p in paragraphs])
+    else:
+        # Fallback to general body text if specific paragraphs aren't found
+        text = soup.get_text(separator=' ')
+
+    return clean_text(text)
+
+def fetch_text_from_url(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return extract_text_from_html(resp.text)
+    except requests.exceptions.RequestException as e:
+        raise ValueError(f"Could not fetch URL: {str(e)}")
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -103,29 +148,44 @@ def index():
     last_url = ""
     last_text = ""
     last_length = "short"
+
     if request.method == "POST":
         last_url = (request.form.get("url") or "").strip()
         last_text = (request.form.get("text") or "").strip()
         last_length = (request.form.get("length") or "short").lower()
-        preset = LENGTH_PRESETS.get(last_length, LENGTH_PRESETS["short"])
-        target_words = preset["target_words"]
-        max_sentences = preset["max_sentences"]
+
         try:
+            # Logic: If URL is provided, it takes precedence
+            input_text = ""
+            
             if last_url:
-                if not _looks_like_url(last_url):
-                    raise ValueError("Please enter a valid URL starting with http:// or https://")
-                page_text = fetch_text_from_url(last_url)
-                page_text = page_text[:12000]
-                if not page_text or len(page_text.split()) < 20:
-                    raise ValueError("Couldn't extract enough text from the URL.")
-                summary = summarize_text(page_text, target_words=target_words, max_sentences=max_sentences)
+                 # Check simple validity
+                u = urlparse(last_url)
+                if not (u.scheme and u.netloc):
+                     raise ValueError("Invalid URL format.")
+                input_text = fetch_text_from_url(last_url)
             else:
-                if not last_text or len(last_text.split()) < 5:
-                    raise ValueError("Please paste at least a few words of text or provide a URL.")
-                summary = summarize_text(last_text, target_words=target_words, max_sentences=max_sentences)
+                input_text = last_text
+
+            # Sanity check on input length
+            if len(input_text.split()) < 100:
+                raise ValueError("Not enough text to summarize. Please provide at least 100 words.")
+
+            # Run summarization
+            summary = summarize_text(input_text, preset_name=last_length)
+            
         except Exception as e:
             error = str(e)
-    return render_template("index.html", summary=summary, error=error, last_url=last_url, last_text=last_text, last_length=last_length)
+
+    # Variables passed here match your index.html specific Jinja variables
+    return render_template(
+        "index.html", 
+        summary=summary, 
+        error=error, 
+        last_url=last_url, 
+        last_text=last_text, 
+        last_length=last_length
+    )
 
 if __name__ == "__main__":
     app.run(debug=True)
