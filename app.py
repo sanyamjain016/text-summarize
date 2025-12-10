@@ -7,8 +7,7 @@ import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import sent_tokenize, word_tokenize
 
-# --- NLTK Setup ---
-# We check for resources to avoid constant downloading
+
 required_nltk = [
     ("punkt", "tokenizers/punkt"),
     ("punkt_tab", "tokenizers/punkt_tab"),
@@ -23,8 +22,6 @@ for res, path in required_nltk:
 
 app = Flask(__name__)
 
-# --- Configuration ---
-# Adjusted presets for better reading flow
 LENGTH_PRESETS = {
     "short":  {"target_words": 100, "min_sentences": 2, "max_sentences": 3},
     "medium": {"target_words": 200, "min_sentences": 4, "max_sentences": 6},
@@ -33,33 +30,23 @@ LENGTH_PRESETS = {
 
 def clean_text(text):
     """Basic cleanup of raw text."""
-    # Remove citation brackets like [1], [12]
     text = re.sub(r'\[\d+\]', '', text)
-    # Collapse multiple spaces/newlines
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def summarize_text(text: str, preset_name: str = "short") -> str:
-    """
-    Extractive summarization using weighted frequency.
-    Improves upon the original by preventing mid-sentence cut-offs
-    and normalizing scores to avoid bias toward long sentences.
-    """
     if not text:
         return ""
 
     text = clean_text(text)
     sentences = sent_tokenize(text)
     
-    # If text is very short, just return it
     if len(sentences) <= LENGTH_PRESETS["short"]["max_sentences"]:
         return text
 
-    # Get constraints based on preset
     settings = LENGTH_PRESETS.get(preset_name, LENGTH_PRESETS["short"])
     max_sents = settings["max_sentences"]
     
-    # 1. Frequency Analysis
     try:
         stop_words = set(stopwords.words("english"))
     except:
@@ -71,16 +58,13 @@ def summarize_text(text: str, preset_name: str = "short") -> str:
         if word.isalnum() and word not in stop_words:
             freq_table[word] = freq_table.get(word, 0) + 1
 
-    # Normalize frequencies (divide by max frequency)
     if freq_table:
         max_freq = max(freq_table.values())
         for word in freq_table:
             freq_table[word] = freq_table[word] / max_freq
     else:
-        # Fallback if no valid words found
         return " ".join(sentences[:max_sents])
 
-    # 2. Score Sentences
     sentence_scores = {}
     for i, sentence in enumerate(sentences):
         sentence_word_count = 0
@@ -90,42 +74,30 @@ def summarize_text(text: str, preset_name: str = "short") -> str:
                 score += freq_table[word]
                 sentence_word_count += 1
         
-        # KEY IMPROVEMENT: Normalization
-        # We divide score by word count so very long sentences don't unfairly win.
-        # We also ignore very short sentences (under 4 words) as they are usually noise.
+
         if sentence_word_count > 4:
             sentence_scores[i] = score / sentence_word_count 
 
-    # 3. Select Top Sentences
-    # Sort by score descending
     sorted_indices = sorted(sentence_scores, key=sentence_scores.get, reverse=True)
     
-    # Take top N sentences based on preset
     selected_indices = sorted_indices[:max_sents]
     
-    # 4. Reorder by appearance in original text to maintain flow
     selected_indices.sort()
     
     final_summary = " ".join([sentences[i] for i in selected_indices])
     return final_summary
 
 def extract_text_from_html(html: str) -> str:
-    """
-    Improved extraction: Prioritizes paragraph tags to avoid 
-    grabbing navigation menus and footers.
-    """
+
     soup = BeautifulSoup(html, "html.parser")
     
-    # Kill all script and style elements
     for script in soup(["script", "style", "noscript", "nav", "footer", "header"]):
         script.extract()    
 
-    # Strategy: Try to get text from <p> tags first as they contain the meat of articles
     paragraphs = soup.find_all('p')
     if len(paragraphs) > 5:
         text = ' '.join([p.get_text() for p in paragraphs])
     else:
-        # Fallback to general body text if specific paragraphs aren't found
         text = soup.get_text(separator=' ')
 
     return clean_text(text)
@@ -155,29 +127,24 @@ def index():
         last_length = (request.form.get("length") or "short").lower()
 
         try:
-            # Logic: If URL is provided, it takes precedence
             input_text = ""
             
             if last_url:
-                 # Check simple validity
                 u = urlparse(last_url)
                 if not (u.scheme and u.netloc):
-                     raise ValueError("Invalid URL format.")
+                    raise ValueError("Invalid URL format.")
                 input_text = fetch_text_from_url(last_url)
             else:
                 input_text = last_text
 
-            # Sanity check on input length
             if len(input_text.split()) < 100:
                 raise ValueError("Not enough text to summarize. Please provide at least 100 words.")
 
-            # Run summarization
             summary = summarize_text(input_text, preset_name=last_length)
             
         except Exception as e:
             error = str(e)
 
-    # Variables passed here match your index.html specific Jinja variables
     return render_template(
         "index.html", 
         summary=summary, 
