@@ -23,9 +23,9 @@ for res, path in required_nltk:
 app = Flask(__name__)
 
 LENGTH_PRESETS = {
-    "short":  {"target_words": 100, "min_sentences": 2, "max_sentences": 3},
-    "medium": {"target_words": 200, "min_sentences": 4, "max_sentences": 6},
-    "long":   {"target_words": 350, "min_sentences": 7, "max_sentences": 12},
+    "short":  {"target_words": 100, "min_sentences": 2, "max_sentences": 6},
+    "medium": {"target_words": 200, "min_sentences": 4, "max_sentences": 10},
+    "long":   {"target_words": 350, "min_sentences": 7, "max_sentences": 16},
 }
 
 def clean_text(text):
